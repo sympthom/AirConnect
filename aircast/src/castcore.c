@@ -40,9 +40,7 @@ static void *CastPingThread(void *args);
 extern log_level cast_loglevel;
 static log_level *loglevel = &cast_loglevel;
 
-
 #define DEFAULT_RECEIVER	"CC1AD845"
-
 
 /*----------------------------------------------------------------------------*/
 #if OSX
@@ -126,7 +124,6 @@ void InitSSL(void)
 
 	glSSLctx = SSL_CTX_new(method);
 	SSL_CTX_set_options(glSSLctx, SSL_OP_NO_SSLv2);
-
 }
 
 
@@ -380,6 +377,9 @@ bool CastConnect(struct sCastCtx *Ctx)
 	SendCastMessage(Ctx, CAST_CONNECTION, NULL, "{\"type\":\"CONNECT\"}");
 	pthread_mutex_unlock(&Ctx->Mutex);
 
+	// wake up everybody who can be waiting
+	WakeAll();
+
 	return true;
 }
 
@@ -478,17 +478,37 @@ bool UpdateCastDevice(struct sCastCtx *Ctx, struct in_addr ip, u16_t port)
 
 
 /*----------------------------------------------------------------------------*/
+struct in_addr GetAddr(struct sCastCtx *Ctx)
+{
+	return Ctx->ip;
+}
+
+
+/*----------------------------------------------------------------------------*/
 void DeleteCastDevice(struct sCastCtx *Ctx)
 {
 	pthread_mutex_lock(&Ctx->Mutex);
 	Ctx->running = false;
-	CastDisconnect(Ctx);
 	pthread_mutex_unlock(&Ctx->Mutex);
+
+	CastDisconnect(Ctx);
+
+	// wake up cast communication & ping threads
+	WakeAll();
+
 	pthread_join(Ctx->PingThread, NULL);
 	pthread_join(Ctx->Thread, NULL);
+
+	// wake-up threads locked on GetTimedEvent
+	pthread_mutex_lock(&Ctx->eventMutex);
+	pthread_cond_signal(&Ctx->eventCond);
+	pthread_mutex_unlock(&Ctx->eventMutex);
+
+	// cleanup mutexes & conds
 	pthread_cond_destroy(&Ctx->eventCond);
 	pthread_mutex_destroy(&Ctx->eventMutex);
 	pthread_mutex_destroy(&Ctx->sslMutex);
+
 	LOG_INFO("[%p]: Cast device stopped", Ctx->owner);
 	SSL_free(Ctx->ssl);
 	free(Ctx);
@@ -595,7 +615,7 @@ void ProcessQueue(tCastCtx *Ctx) {
 		str = json_dumps(msg, JSON_ENCODE_ANY | JSON_INDENT(1));
 		SendCastMessage(Ctx, CAST_MEDIA, Ctx->transportId, "%s", str);
 		NFREE(str);
-
+		
 		json_decref(msg);
    }
 
@@ -606,11 +626,11 @@ void ProcessQueue(tCastCtx *Ctx) {
 		// version 1.24
 		if (Ctx->stopReceiver) {
 			SendCastMessage(Ctx, CAST_RECEIVER, NULL,
-						"{\"type\":\"STOP\",\"requestId\":%d,\"sessionId\":%d}", Ctx->waitId, Ctx->mediaSessionId);
+						"{\"type\":\"STOP\",\"requestId\":%d}", Ctx->waitId);
 			Ctx->Status = CAST_CONNECTED;
 
 		}
-		else {
+		else if (Ctx->mediaSessionId) {
 			SendCastMessage(Ctx, CAST_MEDIA, Ctx->transportId,
 							"{\"type\":\"STOP\",\"requestId\":%d,\"mediaSessionId\":%d}",
 							Ctx->waitId, Ctx->mediaSessionId);
@@ -653,7 +673,7 @@ static void *CastPingThread(void *args)
 			last = now;
 		}
 
-		usleep(50000);
+		WakeableSleep(1500);
 	}
 
 	// clear SSL error allocated memorry
@@ -680,7 +700,7 @@ static void *CastSocketThread(void *args)
 
 		// allow "virtual" power off
 		if (Ctx->Status == CAST_DISCONNECTED) {
-			usleep(100000);
+			WakeableSleep(0);
 			continue;
 		}
 
@@ -721,7 +741,7 @@ static void *CastSocketThread(void *args)
 				if (Ctx->stopReceiver) {
 					json_decref(root);
 					forward = false;
-                }
+				}
 			}
 
 			// respond to device ping
@@ -779,16 +799,15 @@ static void *CastSocketThread(void *args)
 				// media status only acquired for expected id
 				if (!strcasecmp(str,"MEDIA_STATUS") && Ctx->waitMedia == requestId) {
 					int id = GetMediaItem_I(root, 0, "mediaSessionId");
+
 					if (id) {
 						Ctx->waitMedia = 0;
 						Ctx->mediaSessionId = id;
 						LOG_INFO("[%p]: Media session id %d", Ctx->owner, Ctx->mediaSessionId);
 						// set media volume when session is re-connected
 						SetMediaVolume(Ctx, Ctx->MediaVolume);
-					}
-					else {
-						LOG_ERROR("[%p]: waitMedia match but no session %u",
-							Ctx->owner, Ctx->waitMedia);
+					} else {
+						LOG_ERROR("[%p]: waitMedia match but no session %u", Ctx->owner, Ctx->waitMedia);
 					}
 
 					// Don't need to forward this, no valuable info

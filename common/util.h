@@ -54,12 +54,21 @@ typedef struct metadata_s {
 	u32_t track;
 	u32_t duration;
 	u32_t track_hash;
+	u32_t sample_rate;
+	u8_t  sample_size;
+	u8_t  channels;
 } metadata_t;
 
 
 typedef struct list_s {
 	struct list_s *next;
 } list_t;
+
+void 		InitUtils(void);
+void		EndUtils(void);
+
+void		WakeableSleep(u32_t ms);
+void		WakeAll(void);
 
 void 		QueueInit(tQueue *queue, bool mutex, void (*f)(void*));
 void 		QueueInsert(tQueue *queue, void *item);
@@ -74,6 +83,7 @@ list_t*   	remove_item(list_t *item, list_t **list);
 void 		clear_list(list_t **list, void (*free_func)(void *));
 
 void 		free_metadata(struct metadata_s *metadata);
+void 		dup_metadata(struct metadata_s *dst, struct metadata_s *src);
 
 int			pthread_cond_reltimedwait(pthread_cond_t *cond, pthread_mutex_t *mutex, u32_t msWait);
 
@@ -82,7 +92,7 @@ const char 	*XMLGetLocalName(IXML_Document *doc, int Depth);
 IXML_Node  	*XMLAddNode(IXML_Document *doc, IXML_Node *parent, char *name, char *fmt, ...);
 IXML_Node  	*XMLUpdateNode(IXML_Document *doc, IXML_Node *parent, bool refresh, char *name, char *fmt, ...);
 int 	   	XMLAddAttribute(IXML_Document *doc, IXML_Node *parent, char *name, char *fmt, ...);
-char 	   	*XMLGetFirstDocumentItem(IXML_Document *doc, const char *item);
+char 	   	*XMLGetFirstDocumentItem(IXML_Document *doc, const char *item, bool strict);
 char 		*XMLGetFirstElementItem(IXML_Element *element, const char *item);
 bool 		XMLMatchDocumentItem(IXML_Document *doc, const char *item, const char *s);
 #endif
@@ -92,6 +102,7 @@ u32_t 		gettime_ms(void);
 char*		stristr(char *s1, char *s2);
 #if WIN
 char* 		strsep(char** stringp, const char* delim);
+char 		*strndup(const char *s, size_t n);
 int 		asprintf(char **strp, const char *fmt, ...);
 #else
 char 		*strlwr(char *str);

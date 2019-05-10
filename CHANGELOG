@@ -1,3 +1,92 @@
+0.2.10.0
+ - openSSL loaded manually for compatibility 
+ 
+0.2.9.0
+ - (aircast) authorize "on behalf" announces as long as they are not from a group member
+
+0.2.8.0
+ - silence frames count on http reconnect shall be 0 when already sending silence
+ - limit packet recovery to max of rtp latency and http delay
+ - misc network congestion corrections
+ - forced fill http moved to :f option on latencies
+ - add <drift> parameter
+ - STILL NEED TO KNOW WHY AIRCAST LOCKS ON EXIT 
+
+0.2.7.0
+ - add parameter to disable range acceptance in hairtunes (needed for shairtunes2)
+ - send silence frames as soon as playtime reached to ensure continuous HTTP stream
+ - reduce initial silence frames by number of already received frames
+ - discriminate FLUSH send at start to clean pipe from FLUSH used to stop playback using RECORD values and timer
+ - resend timeout was wrong (in http thread)
+ - silence frames count on http reconnect shall be 0 when already sending silence
+ - discard NTP sync that have a larger roundtrip (100ms)
+ - RTP latency can be negative to force filling of silence frame when buffer is empty but playtime has elapsed (continuous stream)
+
+0.2.6.1
+ - (cast) simplify device removal (no explicit wakeup call)
+ 
+0.2.6.0
+ - move RTSP server back to using accept() instead of select() and use connect() to close the connection
+ - remove usage of sleep() to redeuce CPU consumption in idle
+
+0.2.5.0
+  - backport some squeeze2upnp/cast changes with no impact
+  - add -n option in airupnp to exclude model number
+  
+0.2.4.0
+ - Detect main IP address change and restart
+ 
+0.2.3.1
+ - version mistake with 0.2.3.0
+ 
+0.2.3.0
+ - add -c <codec> command line
+ - work with CC that require a range request (buffer up to 2MB)
+ - metadata was freed after ctx was released
+ - silence frame shall be ignored when range requested
+ - default codec for upnp was 'flac' instead of 'flc'
+ 
+0.2.2.6
+ - set length for silent frame now that length must be returned
+ 
+0.2.2.5
+ - aesiv and aeskey can start with a '\0', use a decrypt explicit boolean
+ - QueueFlush correction
+ 
+0.2.2.4 
+ - Group update could free NULL pointer (cast only)
+
+0.2.2.3
+ - artwork was not a duplication, hence releasing metadata was failing (upnp only)
+ 
+0.2.2.2
+ - update build toolchain to full cross compiling, including OSX, FreeBSD and Solaris
+ - added Linux ppc
+ - (cast) stop receiver should send STOP to sessionId, not mediaSessionId
+ 
+0.2.2.1
+ - flac codec name is 'flc' not 'flac'
+
+0.2.2.0
+ - add mp3 for encoding and icy metadata
+ - use Sonos radio stream url for mp3
+ - add option to set flac compression level
+ - encoder was not mutex protected against flush
+  
+0.2.1.1
+ - Some controlers like AirParrot do not send encrypted audio
+ 
+0.2.1.0
+ - add static <artwork> parameter
+ - 32 bits comparaison correction
+ - (aircast) do not set playing state on "buffering" event
+ 
+0.2.0.8
+ - add aarch64
+ 
+0.2.0.7
+ - loglimit was not used in airupnp
+ 
 0.2.0.6
  - kd_dump was writing in a NULL string when no header was received
  

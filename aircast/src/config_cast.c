@@ -79,7 +79,10 @@ void SaveConfig(char *name, void *ref, bool full)
 	XMLUpdateNode(doc, common, false, "stop_receiver", "%d", (int) glMRConfig.StopReceiver);
 	XMLUpdateNode(doc, common, false, "media_volume", "%0.4lf", glMRConfig.MediaVolume);
 	XMLUpdateNode(doc, common, false, "latency", glMRConfig.Latency);
+	XMLUpdateNode(doc, common, false, "drift", "%d", glMRConfig.Drift);
 	XMLUpdateNode(doc, common, false, "codec", glMRConfig.Codec);
+	XMLUpdateNode(doc, common, false, "metadata", "%d", glMRConfig.Metadata);
+	XMLUpdateNode(doc, common, false, "artwork", glMRConfig.ArtWork);
 
 	for (i = 0; i < MAX_RENDERERS; i++) {
 		IXML_Node *dev_node;
@@ -133,9 +136,11 @@ static void LoadConfigItem(tMRConfig *Conf, char *name, char *val)
 	if (!strcmp(name, "enabled")) Conf->Enabled = atol(val);
 	if (!strcmp(name, "stop_receiver")) Conf->StopReceiver = atol(val);
 	if (!strcmp(name, "media_volume")) Conf->MediaVolume = atof(val);
-	if (!strcmp(name, "use_flac")) strcpy(Conf->Codec, "flac");  // temporary
 	if (!strcmp(name, "codec")) strcpy(Conf->Codec, val);
+	if (!strcmp(name, "metadata")) Conf->Metadata = atoi(val);
+	if (!strcmp(name, "artwork")) strcpy(Conf->ArtWork, val);
 	if (!strcmp(name, "latency")) strcpy(Conf->Latency, val);
+	if (!strcmp(name, "drift")) Conf->Drift = atoi(val);
 	if (!strcmp(name, "name")) strcpy(Conf->Name, val);
 	if (!strcmp(name, "mac"))  {
 		unsigned mac[6];

@@ -34,8 +34,9 @@
 #include "mdnsd.h"
 #include "raopcore.h"
 #include "config_cast.h"
+#include "sslsym.h"
 
-#define VERSION "v0.2.0.6"" ("__DATE__" @ "__TIME__")"
+#define VERSION "v0.2.10.0"" ("__DATE__" @ "__TIME__")"
 
 #define DISCOVERY_TIME 20
 
@@ -53,10 +54,13 @@ tMRConfig			glMRConfig = {
 							true,	// enabled
 							false,	// stop_receiver
 							"",		// name
-							"flac",	// use_flac
+							"flc",	// use_flac
+							true,	// metadata
 							0.5,	// media volume (0..1)
 							{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
 							"",		// rtp/http_latency (0 = use client's request)
+							false,	// drift
+							"", 	// artwork
 					};
 
 /*----------------------------------------------------------------------------*/
@@ -82,8 +86,6 @@ static pthread_t 			glMainThread, glmDNSsearchThread;
 static char					*glLogFile;
 static char					*glHostName = NULL;
 static bool					glDiscovery = false;
-static pthread_mutex_t		glMainMutex;
-static pthread_cond_t		glMainCond;
 static bool					glInteractive = true;
 static char					*glPidFile = NULL;
 static bool					glAutoSaveConfigFile = false;
@@ -92,17 +94,17 @@ static char 				glInterface[16] = "?";
 static void					*glConfigID = NULL;
 static char					glConfigName[_STR_LEN_] = "./config.xml";
 static struct mdnsd*		glmDNSServer = NULL;
-static bool 				glDrift = false;
 
 static char usage[] =
 			VERSION "\n"
 		   "See -t for license terms\n"
 		   "Usage: [options]\n"
 		   "  -b <address>\t\tnetwork address to bind to\n"
+  		   "  -c <mp3[:<rate>]|flc[:0..9]|wav>\taudio format send to player\n"
 		   "  -x <config file>\tread config from file (default is ./config.xml)\n"
 		   "  -i <config file>\tdiscover players, save <config file> and exit\n"
 		   "  -I \t\t\tauto save config at every network scan\n"
-		   "  -l <[rtp][:http]>\tset RTP and HTTP latency (ms)\n"
+		   "  -l <[rtp][:http][:f]>\tRTP and HTTP latency (ms), ':f' forces silence fill\n"
 		   "  -r \t\t\tlet timing reference drift (no click)\n"
 		   "  -f <logfile>\t\tWrite debug to logfile\n"
 		   "  -p <pid file>\t\twrite PID in file\n"
@@ -157,6 +159,8 @@ static char license[] =
 static void *MRThread(void *args);
 static bool  AddCastDevice(struct sMR *Device, char *Name, char *UDN, bool Group, struct in_addr ip, u16_t port);
 static void  RemoveCastDevice(struct sMR *Device);
+static bool	 Start(bool cold);
+static bool	 Stop(bool exit);
 
 void callback(void *owner, raop_event_t event, void *param)
 {
@@ -195,14 +199,19 @@ void callback(void *owner, raop_event_t event, void *param)
 			metadata_t MetaData = { "", "", "Streaming from AirConnect",
 									"", "", NULL, 0, 0, 0 };
 
+			if (*Device->Config.ArtWork) MetaData.artwork = Device->Config.ArtWork;
+
 			LOG_INFO("[%p]: Play", Device);
 			if (Device->RaopState != RAOP_PLAY) {
-				char *uri;
+				char *uri, *ContentType;
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-result"
 				asprintf(&uri, "http://%s:%u/stream", inet_ntoa(glHost), *((short unsigned*) param));
 #pragma GCC diagnostic pop
-				CastLoad(Device->CastCtx, uri, !strcasecmp(Device->Config.Codec, "flac") ? "audio/flac" : "audio/wav", &MetaData);
+				if (!strcasecmp(Device->Config.Codec, "mp3")) ContentType = "audio/mp3";
+				else if (!strcasecmp(Device->Config.Codec, "wav")) ContentType = "audio/wav";
+				else ContentType = "audio/flac";
+				CastLoad(Device->CastCtx, uri, ContentType, &MetaData);
 				free(uri);
 			}
 
@@ -231,7 +240,7 @@ void callback(void *owner, raop_event_t event, void *param)
 #define MAX_ACTION_ERRORS (5)
 static void *MRThread(void *args)
 {
-	int elapsed;
+	int elapsed, wakeTimer = TRACK_POLL;
 	unsigned last = gettime_ms();
 	struct sMR *p = (struct sMR*) args;
 	json_t *data;
@@ -240,13 +249,20 @@ static void *MRThread(void *args)
 		double Volume = -1;
 
 		// context is valid until this thread ends, no deletion issue
-		data = GetTimedEvent(p->CastCtx, 250);
+		data = GetTimedEvent(p->CastCtx, wakeTimer);
 		elapsed = gettime_ms() - last;
 
 		// need to protect against events from CC threads, not from deletion
 		pthread_mutex_lock(&p->Mutex);
 
-		LOG_SDEBUG("Cast thread timer %d", elapsed);
+		// need to check status there, protected
+		if (!p->Running) {
+			pthread_mutex_unlock(&p->Mutex);
+			break;
+		}
+
+		wakeTimer = (p->State != STOPPED) ? TRACK_POLL : TRACK_POLL * 10;
+		LOG_SDEBUG("[%p]: Cast thread timer %d %d", p, elapsed, wakeTimer);
 
 		// a message has been received
 		if (data) {
@@ -257,7 +273,7 @@ static void *MRThread(void *args)
 			if (type && !strcasecmp(type, "MEDIA_STATUS")) {
 				const char *state = GetMediaItem_S(data, 0, "playerState");
 
-				if (state && (!strcasecmp(state, "PLAYING") || !strcasecmp(state, "BUFFERING")) && p->State != PLAYING) {
+				if (state && !strcasecmp(state, "PLAYING") && p->State != PLAYING) {
 					LOG_INFO("[%p]: Cast playing", p);
 					p->State = PLAYING;
 					if (p->RaopState != RAOP_PLAY) raop_notify(p->Raop, RAOP_PLAY, NULL);
@@ -269,7 +285,7 @@ static void *MRThread(void *args)
 					if (p->RaopState == RAOP_PLAY) raop_notify(p->Raop, RAOP_PAUSE, NULL);
 				}
 
-				if (state && !strcasecmp(state, "IDLE")  && p->State != STOPPED) {
+				if (state && !strcasecmp(state, "IDLE") && p->State != STOPPED) {
 					const char *cause = GetMediaItem_S(data, 0, "idleReason");
 					if (cause && !p->ExpectStop) {
 						LOG_INFO("[%p]: Cast stopped by other remote", p);
@@ -310,10 +326,9 @@ static void *MRThread(void *args)
 			json_decref(data);
 		}
 
-
 		// get track position & CurrentURI
 		p->TrackPoll += elapsed;
-		if (p->TrackPoll > TRACK_POLL) {
+		if (p->TrackPoll >= TRACK_POLL) {
 			p->TrackPoll = 0;
 			if (p->State != STOPPED) CastGetMediaStatus(p->CastCtx);
 		}
@@ -354,6 +369,17 @@ static struct sMR *SearchUDN(char *UDN)
 
 
 /*----------------------------------------------------------------------------*/
+static bool isMember(struct in_addr host) {
+	int i;
+	for (i = 0; i < MAX_RENDERERS; i++) {
+		 if (glMRDevices[i].Running && GetAddr(glMRDevices[i].CastCtx).s_addr == host.s_addr)
+			return true;
+	}
+	return false;
+}
+
+
+/*----------------------------------------------------------------------------*/
 bool mDNSsearchCallback(mDNSservice_t *slist, void *cookie, bool *stop)
 {
 	struct sMR *Device;
@@ -388,7 +414,8 @@ bool mDNSsearchCallback(mDNSservice_t *slist, void *cookie, bool *stop)
 		int j;
 
 		// is the mDNS record usable or announce made on behalf
-		if ((UDN = GetmDNSAttribute(s->attr, s->attr_count, "id")) == NULL || s->host.s_addr != s->addr.s_addr) continue;
+		if ((UDN = GetmDNSAttribute(s->attr, s->attr_count, "id")) == NULL ||
+			(s->host.s_addr != s->addr.s_addr && isMember(s->host))) continue;
 
 		// is that device already here
 		if ((Device = SearchUDN(UDN)) != NULL) {
@@ -408,7 +435,7 @@ bool mDNSsearchCallback(mDNSservice_t *slist, void *cookie, bool *stop)
 						} else {
 							struct sGroupMember *Member = Device->GroupMaster;
 							while (Member && (Member->Host.s_addr != s->host.s_addr)) Member = Member->Next;
-							free(remove_item((list_t*) Member, (list_t**) &Device->GroupMaster));
+							if (Member) free(remove_item((list_t*) Member, (list_t**) &Device->GroupMaster));
 						}
 					}
 				}
@@ -461,9 +488,10 @@ bool mDNSsearchCallback(mDNSservice_t *slist, void *cookie, bool *stop)
 		if (!Name) Name = strdup(s->hostname);
 
 		if (AddCastDevice(Device, Name, UDN, Group, s->addr, s->port) && !glDiscovery) {
-			Device->Raop = raop_create(glHost, glmDNSServer, Device->Config.Name, "aircast", Device->Config.mac,
-										!strcasecmp(Device->Config.Codec, "flac") ? "flac" : "wav",
-										glDrift, Device->Config.Latency, Device, callback);
+			Device->Raop = raop_create(glHost, glmDNSServer, Device->Config.Name,
+										"aircast", Device->Config.mac, Device->Config.Codec,
+										Device->Config.Metadata, Device->Config.Drift, Device->Config.Latency,
+										Device, callback);
 			if (!Device->Raop) {
 				LOG_ERROR("[%p]: cannot create RAOP instance (%s)", Device, Device->Config.Name);
 				RemoveCastDevice(Device);
@@ -499,9 +527,8 @@ static void *MainThread(void *args)
 {
 	while (glMainRunning) {
 
-		pthread_mutex_lock(&glMainMutex);
-		pthread_cond_reltimedwait(&glMainCond, &glMainMutex, 30*1000);
-		pthread_mutex_unlock(&glMainMutex);
+		WakeableSleep(30*1000);
+		if (!glMainRunning) break;
 
 		if (glLogFile && glLogLimit != - 1) {
 			u32_t size = ftell(stderr);
@@ -524,6 +551,18 @@ static void *MainThread(void *args)
 				if (!freopen(glLogFile, "a", stderr)) {
 					LOG_ERROR("re-open error while truncating log", NULL);
 				}
+			}
+		}
+
+		// try to detect IP change when auto-detect
+		if (strstr(glInterface, "?")) {
+			struct in_addr host;
+			host.s_addr = get_localhost(NULL);
+			if (host.s_addr != INADDR_ANY && host.s_addr != glHost.s_addr) {
+				LOG_INFO("IP change detected %s", inet_ntoa(glHost));
+				Stop(false);
+				glMainRunning = true;
+				Start(false);
 			}
 		}
 	}
@@ -624,84 +663,95 @@ void RemoveCastDevice(struct sMR *Device)
 	pthread_mutex_lock(&Device->Mutex);
 	Device->Running = false;
 	pthread_mutex_unlock(&Device->Mutex);
+
+	// device's thread can still be running but this will wake it up and end it
+	DeleteCastDevice(Device->CastCtx);
+
 	pthread_join(Device->Thread, NULL);
 
 	clear_list((list_t**) &Device->GroupMaster, free);
-
-	// device's thread has ended, so no risk of event generated by CC threads
-	// to create some reaction, we can safely terminate CC part here
-	DeleteCastDevice(Device->CastCtx);
 }
 
 /*----------------------------------------------------------------------------*/
-static bool Start(void)
+static bool Start(bool cold)
 {
 	int i;
 	char hostname[_STR_LEN_];
 
-	// mutexes must always be valid
-	memset(&glMRDevices, 0, sizeof(glMRDevices));
-	for (i = 0; i < MAX_RENDERERS; i++) pthread_mutex_init(&glMRDevices[i].Mutex, 0);
-
-	InitSSL();
-
 	glHost.s_addr = get_localhost(&glHostName);
 	if (!strstr(glInterface, "?")) glHost.s_addr = inet_addr(glInterface);
+	snprintf(hostname, _STR_LEN_, "%s.local", glHostName);
 
 	LOG_INFO("Binding to %s", inet_ntoa(glHost));
 
-	snprintf(hostname, _STR_LEN_, "%s.local", glHostName);
-	if ((glmDNSServer = mdnsd_start(glHost)) == NULL) return false;
+	if (cold) {
+		// manually load openSSL symbols to accept multiple versions
+		if (!load_ssl_symbols()) {
+			LOG_ERROR("Cannot load SSL libraries", NULL);
+			return false;
+		}
 
-	// initialize mDNS broadcast
-	mdnsd_set_hostname(glmDNSServer, hostname, glHost);
+		// mutexes must always be valid
+		memset(&glMRDevices, 0, sizeof(glMRDevices));
+		for (i = 0; i < MAX_RENDERERS; i++) pthread_mutex_init(&glMRDevices[i].Mutex, 0);
 
-	/* start the main thread */
-	pthread_mutex_init(&glMainMutex, 0);
-	pthread_cond_init(&glMainCond, 0);
-	pthread_create(&glMainThread, NULL, &MainThread, NULL);
+		InitUtils();
+		InitSSL();
 
-	/* start the mDNS devices discovery thread */
-	glmDNSsearchHandle = init_mDNS(false, glHost);
-	pthread_create(&glmDNSsearchThread, NULL, &mDNSsearchThread, NULL);
+		// start the main thread
+		pthread_create(&glMainThread, NULL, &MainThread, NULL);
+	}
+
+	if (glHost.s_addr != INADDR_ANY) {
+		// initialize mDNS broadcast
+		if ((glmDNSServer = mdnsd_start(glHost)) == NULL) return false;
+		mdnsd_set_hostname(glmDNSServer, hostname, glHost);
+
+		// start the mDNS devices discovery thread
+		glmDNSsearchHandle = init_mDNS(false, glHost);
+		pthread_create(&glmDNSsearchThread, NULL, &mDNSsearchThread, NULL);
+	}
 
 	return true;
 }
 
-static bool Stop(void)
+static bool Stop(bool exit)
 {
 	int i;
 
 	glMainRunning = false;
 
-	LOG_DEBUG("terminate search thread ...", NULL);
-	// this forces an ongoing search to end
-	close_mDNS(glmDNSsearchHandle);
-	pthread_join(glmDNSsearchThread, NULL);
+	if (glHost.s_addr != INADDR_ANY) {
+		LOG_DEBUG("terminate search thread ...", NULL);
+		// this forces an ongoing search to end
+		close_mDNS(glmDNSsearchHandle);
+		pthread_join(glmDNSsearchThread, NULL);
 
-	LOG_DEBUG("flush renderers ...", NULL);
-	FlushCastDevices();
+		LOG_DEBUG("flush renderers ...", NULL);
+		FlushCastDevices();
 
-	// stop broadcasting devices
-	mdnsd_stop(glmDNSServer);
+		// stop broadcasting devices
+		mdnsd_stop(glmDNSServer);
+	}
 
-	LOG_DEBUG("terminate main thread ...", NULL);
-	pthread_cond_signal(&glMainCond);
-	pthread_join(glMainThread, NULL);
-	pthread_mutex_destroy(&glMainMutex);
-	pthread_cond_destroy(&glMainCond);
-	for (i = 0; i < MAX_RENDERERS; i++) pthread_mutex_destroy(&glMRDevices[i].Mutex);
+	if (exit) {
+		LOG_DEBUG("terminate main thread ...", NULL);
+		WakeAll();
+		pthread_join(glMainThread, NULL);
+		for (i = 0; i < MAX_RENDERERS; i++) pthread_mutex_destroy(&glMRDevices[i].Mutex);
 
-	LOG_DEBUG("terminate SSL ...", NULL);
-	EndSSL();
+		EndSSL();
+		EndUtils();
 
-	NFREE(glHostName);
-
-	if (glConfigID) ixmlDocument_free(glConfigID);
+		NFREE(glHostName);
+		if (glConfigID) ixmlDocument_free(glConfigID);
 
 #if WIN
-	winsock_close();
+		winsock_close();
 #endif
+
+		free_ssl_symbols();
+	}
 
 	return true;
 }
@@ -719,7 +769,7 @@ static void sighandler(int signum) {
 		exit(0);
 	}
 
-	Stop();
+	Stop(true);
 	exit(0);
 }
 
@@ -740,7 +790,7 @@ bool ParseArgs(int argc, char **argv) {
 
 	while (optind < argc && strlen(argv[optind]) >= 2 && argv[optind][0] == '-') {
 		char *opt = argv[optind] + 1;
-		if (strstr("bxdpifl", opt) && optind < argc - 1) {
+		if (strstr("bxdpiflc", opt) && optind < argc - 1) {
 			optarg = argv[optind + 1];
 			optind += 2;
 		} else if (strstr("tzZIkr", opt)) {
@@ -755,6 +805,9 @@ bool ParseArgs(int argc, char **argv) {
 		switch (opt[0]) {
 		case 'f':
 			glLogFile = optarg;
+			break;
+		case 'c':
+			strcpy(glMRConfig.Codec, optarg);
 			break;
 		case 'b':
 			strcpy(glInterface, optarg);
@@ -776,7 +829,7 @@ bool ParseArgs(int argc, char **argv) {
 			glGracefullShutdown = false;
 			break;
 		case 'r':
-			glDrift = true;
+			glMRConfig.Drift = true;
 			break;
 		case 'l':
 			strcpy(glMRConfig.Latency, optarg);
@@ -873,9 +926,9 @@ int main(int argc, char *argv[])
 
 	// just do device discovery and exit
 	if (glDiscovery) {
-		Start();
+		Start(true);
 		sleep(DISCOVERY_TIME + 1);
-		Stop();
+		Stop(true);
 		return(0);
 	}
 
@@ -899,7 +952,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (!Start()) {
+	if (!Start(true)) {
 		LOG_ERROR("Cannot start", NULL);
 		exit(1);
 	}
@@ -974,7 +1027,7 @@ int main(int argc, char *argv[])
 	}
 
 	LOG_INFO("stopping Cast devices ...", NULL);
-	Stop();
+	Stop(true);
 	LOG_INFO("all done", NULL);
 
 	return true;

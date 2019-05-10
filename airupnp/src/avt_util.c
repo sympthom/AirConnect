@@ -314,7 +314,7 @@ int GetGroupVolume(struct sMR *Device)
 
 	if (ActionNode) ixmlDocument_free(ActionNode);
 
-	Item = XMLGetFirstDocumentItem(Response, "CurrentVolume");
+	Item = XMLGetFirstDocumentItem(Response, "CurrentVolume", true);
 	if (Response) ixmlDocument_free(Response);
 
 	if (Item) {
@@ -342,7 +342,7 @@ char *GetProtocolInfo(struct sMR *Device)
 	if (ActionNode) ixmlDocument_free(ActionNode);
 
 	if (Response) {
-		ProtocolInfo = XMLGetFirstDocumentItem(Response, "Sink");
+		ProtocolInfo = XMLGetFirstDocumentItem(Response, "Sink", false);
 		ixmlDocument_free(Response);
 		LOG_DEBUG("[%p]: ProtocolInfo %s", Device, ProtocolInfo);
 	}
@@ -404,6 +404,17 @@ char *GetProtocolInfo(struct sMR *Device)
 	}
 
 	XMLAddAttribute(doc, node, "protocolInfo", ProtoInfo);
+
+	// set optional parameters if we have them all (only happens with pcm)
+	if (MetaData->sample_rate && MetaData->sample_size && MetaData->channels) {
+		XMLAddAttribute(doc, node, "sampleFrequency", "%u", MetaData->sample_rate);
+		XMLAddAttribute(doc, node, "bitsPerSample", "%hhu", MetaData->sample_size);
+		XMLAddAttribute(doc, node, "nrAudioChannels", "%hhu", MetaData->channels);
+		if (MetaData->duration)
+			XMLAddAttribute(doc, node, "size", "%u", (u32_t) ((MetaData->sample_rate *
+							MetaData->sample_size / 8 * MetaData->channels *
+							(u64_t) MetaData->duration) / 1000));
+	}
 
 	s = ixmlNodetoString((IXML_Node*) doc);
 

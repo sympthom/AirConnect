@@ -35,6 +35,7 @@
 #include "base64.h"
 #include "raopcore.h"
 #include "hairtunes.h"
+#include "dmap_parser.h"
 #include "log_util.h"
 
 typedef struct raop_ctx_s {
@@ -47,7 +48,7 @@ typedef struct raop_ctx_s {
 	struct in_addr peer;	// IP of the iDevice (airplay sender)
 	char *latencies;
 	bool running;
-	codec_t codec;
+	encode_t encode;
 	bool drift;
 	pthread_t thread, search_thread;
 	unsigned char mac[6];
@@ -81,10 +82,12 @@ static void* 	search_remote(void *args);
 extern char private_key[];
 enum { RSA_MODE_KEY, RSA_MODE_AUTH };
 
+static void on_dmap_string(void *ctx, const char *code, const char *name, const char *buf, size_t len);
+
 /*----------------------------------------------------------------------------*/
 struct raop_ctx_s *raop_create(struct in_addr host, struct mdnsd *svr, char *name,
-						char *model, unsigned char mac[6], char *codec, bool drift,
-						char *latencies, void *owner, raop_cb_t callback) {
+						char *model, unsigned char mac[6], char *codec, bool metadata,
+						bool drift,	char *latencies, void *owner, raop_cb_t callback) {
 	struct raop_ctx_s *ctx = malloc(sizeof(struct raop_ctx_s));
 	struct sockaddr_in addr;
 	socklen_t nlen = sizeof(struct sockaddr);
@@ -105,10 +108,17 @@ struct raop_ctx_s *raop_create(struct in_addr host, struct mdnsd *svr, char *nam
 	ctx->latencies = latencies;
 	ctx->owner = owner;
 	ctx->volume_stamp = gettime_ms() - 1000;
-	if (!strcasecmp(codec, "pcm")) ctx->codec = CODEC_PCM;
-	else if (!strcasecmp(codec, "wav")) ctx->codec = CODEC_WAV;
-	else ctx->codec = CODEC_FLAC;
 	ctx->drift = drift;
+	if (!strcasecmp(codec, "pcm")) ctx->encode.codec = CODEC_PCM;
+	else if (!strcasecmp(codec, "wav")) ctx->encode.codec = CODEC_WAV;
+	else if (stristr(codec, "mp3")) {
+		ctx->encode.codec = CODEC_MP3;
+		ctx->encode.mp3.icy = metadata;
+		if (strchr(codec, ':')) ctx->encode.mp3.bitrate = atoi(strchr(codec, ':') + 1);
+	} else {
+		ctx->encode.codec = CODEC_FLAC;
+		if (strchr(codec, ':')) ctx->encode.flac.level = atoi(strchr(codec, ':') + 1);
+	}
 
 	if (ctx->sock == -1) {
 		LOG_ERROR("Cannot create listening socket", NULL);
@@ -161,10 +171,19 @@ struct raop_ctx_s *raop_create(struct in_addr host, struct mdnsd *svr, char *nam
 
 /*----------------------------------------------------------------------------*/
 void raop_delete(struct raop_ctx_s *ctx) {
+	int sock;
+	struct sockaddr addr;
+	socklen_t nlen = sizeof(struct sockaddr);
 
 	if (!ctx) return;
 
 	ctx->running = false;
+
+	// wake-up thread by connecting socket, needed for freeBSD
+	sock = socket(AF_INET, SOCK_STREAM, 0);
+	getsockname(ctx->sock, (struct sockaddr *) &addr, &nlen);
+	connect(sock, (struct sockaddr*) &addr, sizeof(addr));
+	closesocket(sock);
 
 	pthread_join(ctx->thread, NULL);
 
@@ -211,7 +230,7 @@ void  raop_notify(struct raop_ctx_s *ctx, raop_event_t event, void *param) {
 			break;
 		case RAOP_VOLUME: {
 			// feedback that is less than aecond old is an echo, ignore it
-			if (ctx->volume_stamp + 1000 - gettime_ms() > 0x7fffffff) {
+			if ((ctx->volume_stamp + 1000) - gettime_ms() > 1000) {
 				double Volume = *((double*) param);
 
 				Volume = Volume ? (Volume - 1) * 30 : -144;
@@ -281,16 +300,8 @@ static void *rtsp_thread(void *arg) {
 			struct sockaddr_in peer;
 			socklen_t addrlen = sizeof(struct sockaddr_in);
 
-			FD_ZERO(&rfds);
-			FD_SET(ctx->sock, &rfds);
-
-			// freeBSD does not exit from accept() even when shutdown is made
-			n = select(ctx->sock + 1, &rfds, NULL, NULL, &timeout);
-
-			if (n > 0) {
-				sock = accept(ctx->sock, (struct sockaddr*) &peer, &addrlen);
-				ctx->peer.s_addr = peer.sin_addr.s_addr;
-			}
+			sock = accept(ctx->sock, (struct sockaddr*) &peer, &addrlen);
+			ctx->peer.s_addr = peer.sin_addr.s_addr;
 
 			if (sock != -1 && ctx->running) {
 				LOG_INFO("got RTSP connection %u", sock);
@@ -420,9 +431,9 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		if ((p = stristr(buf, "timing_port")) != NULL) sscanf(p, "%*[^=]=%hu", &tport);
 		if ((p = stristr(buf, "control_port")) != NULL) sscanf(p, "%*[^=]=%hu", &cport);
 
-		ht = hairtunes_init(ctx->peer, ctx->codec, false, ctx->drift, ctx->latencies,
-							ctx->rtsp.aeskey, ctx->rtsp.aesiv,
-							ctx->rtsp.fmtp, cport, tport, ctx, hairtunes_cb);
+		ht = hairtunes_init(ctx->peer, ctx->encode, false, ctx->drift, true, ctx->latencies,
+							ctx->rtsp.aeskey, ctx->rtsp.aesiv, ctx->rtsp.fmtp,
+							cport, tport, ctx, hairtunes_cb);
 
 		ctx->hport = ht.hport;
 		ctx->ht = ht.ctx;
@@ -443,6 +454,9 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		}
 
 	} else if (!strcmp(method, "RECORD")) {
+		unsigned short seqno = 0;
+		unsigned rtptime = 0;
+		char *p;
 
 		if (atoi(ctx->latencies)) {
 			char latency[6];
@@ -450,17 +464,25 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 			kd_add(resp, "Audio-Latency", latency);
 		}
 
+		buf = kd_lookup(headers, "RTP-Info");
+		if ((p = stristr(buf, "seq")) != NULL) sscanf(p, "%*[^=]=%hu", &seqno);
+		if ((p = stristr(buf, "rtptime")) != NULL) sscanf(p, "%*[^=]=%u", &rtptime);
+
+		if (ctx->ht) hairtunes_record(ctx->ht, seqno, rtptime);
+
 		ctx->callback(ctx->owner, RAOP_STREAM, &ctx->hport);
 
 	}  else if (!strcmp(method, "FLUSH")) {
 		unsigned short seqno = 0;
+		unsigned rtptime = 0;
 		char *p;
 
 		buf = kd_lookup(headers, "RTP-Info");
 		if ((p = stristr(buf, "seq")) != NULL) sscanf(p, "%*[^=]=%hu", &seqno);
+		if ((p = stristr(buf, "rtptime")) != NULL) sscanf(p, "%*[^=]=%u", &rtptime);
 
 		// only send FLUSH if useful (discards frames above buffer head and top)
-		if (ctx->ht && hairtunes_flush(ctx->ht, seqno, 0))
+		if (ctx->ht && hairtunes_flush(ctx->ht, seqno, rtptime))
 			ctx->callback(ctx->owner, RAOP_FLUSH, &ctx->hport);
 
 	}  else if (!strcmp(method, "TEARDOWN")) {
@@ -494,6 +516,22 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 			ctx->callback(ctx->owner, RAOP_VOLUME, &volume);
 		}
 
+		if (((p = kd_lookup(headers, "Content-Type")) != NULL) && !strcasecmp(p, "application/x-dmap-tagged")) {
+			struct metadata_s metadata;
+			dmap_settings settings = {
+				NULL, NULL, NULL, NULL,	NULL, NULL,	NULL, on_dmap_string, NULL,
+				NULL
+			};
+
+			settings.ctx = &metadata;
+			memset(&metadata, 0, sizeof(struct metadata_s));
+			if (!dmap_parse(&settings, body, len)) {
+				hairtunes_metadata(ctx->ht, &metadata);
+				LOG_INFO("[%p]: received metadata\n\tartist: %s\n\talbum:  %s\n\ttitle:  %s",
+						 ctx, metadata.artist, metadata.album, metadata.title);
+				free_metadata(&metadata);
+			}
+		}
 	}
 
 	// don't need to free "buf" because kd_lookup return a pointer, not a strdup
@@ -629,6 +667,11 @@ static int  base64_pad(char *src, char **padded)
 	return strlen(*padded);
 }
 
+static void on_dmap_string(void *ctx, const char *code, const char *name, const char *buf, size_t len) {
+	struct metadata_s *metadata = (struct metadata_s *) ctx;
 
-
+	if (!strcasecmp(code, "asar")) metadata->artist = strndup(buf, len);
+	else if (!strcasecmp(code, "asal")) metadata->album = strndup(buf, len);
+	else if (!strcasecmp(code, "minm")) metadata->title = strndup(buf, len);
+}
 

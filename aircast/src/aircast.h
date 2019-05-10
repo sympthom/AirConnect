@@ -53,9 +53,12 @@ typedef struct sMRConfig
 	bool		StopReceiver;
 	char		Name[_STR_LEN_];
 	char		Codec[_STR_LEN_];
+	bool		Metadata;
 	double		MediaVolume;
 	u8_t		mac[6];
 	char		Latency[_STR_LEN_];
+	bool		Drift;
+	char		ArtWork[4*_STR_LEN_];
 } tMRConfig;
 
 struct sMR {
